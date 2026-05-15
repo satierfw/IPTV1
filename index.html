@@ -3318,6 +3318,45 @@ function playUrl(url, opts = {}) {
   vid.style.display = 'block';
   state.lastPlayUrl = url;
 
+  // Hide tap-to-play overlay if visible from previous stream
+  const ttp = document.getElementById('tap-to-play-overlay');
+  if (ttp) ttp.style.display = 'none';
+
+  // iOS Safari: no MSE → HLS.js and mpegts.js won't work at all.
+  // Route directly to native for HLS; for .ts streams try converting to .m3u8 first.
+  const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent) ||
+                (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  if (isIOS) {
+    const typeIOS = detectStreamType(url);
+    if (typeIOS === 'hls') {
+      // Safari plays .m3u8 natively — go straight there
+      $('buffering-text').textContent = 'Engine: Safari HLS';
+      showEngine('Safari HLS');
+      // Wire video-level error for native streams
+      vid.onerror = () => {
+        if (state.lastPlayUrl !== url) return;
+        const live2 = state.activeTab === 'live' || state.activeTab === 'favorites';
+        if (live2 && !tryNextLiveFormat('Erro nativo HLS')) return;
+        showPlaybackError('Não foi possível reproduzir. Tente outro item ou outro proxy.');
+      };
+      fallbackToNative(url, vid);
+      return;
+    }
+    if (typeIOS === 'mpegts' && isXtreamLike(url)) {
+      // iOS can't play raw .ts; try swapping to .m3u8 which Safari handles natively
+      const m3u8url = swapExt(url, 'm3u8');
+      $('buffering-text').textContent = 'Engine: Safari HLS (TS→M3U8)';
+      showEngine('Safari HLS');
+      vid.onerror = () => {
+        if (state.lastPlayUrl !== url && state.lastPlayUrl !== m3u8url) return;
+        showPlaybackError('Não foi possível reproduzir. Tente outro item ou outro proxy.');
+      };
+      fallbackToNative(m3u8url, vid);
+      return;
+    }
+    // For native formats (mp4 etc.) on iOS, fall through to normal native path below
+  }
+
   // Cleanup previous engines (but keep state.lastPlayMeta for fallback context)
   if (state.hls) { try { state.hls.destroy(); } catch (_) {} state.hls = null; }
   if (state.mpegts) {
@@ -3426,9 +3465,61 @@ function playUrl(url, opts = {}) {
 function fallbackToNative(url, vid) {
   $('buffering-text').textContent = 'Engine: Nativo do navegador';
   vid.src = url;
-  vid.play().catch(() => {});
   state.currentEngine = 'native';
   showEngine('Nativo');
+
+  const playPromise = vid.play();
+  if (playPromise !== undefined) {
+    playPromise.catch(err => {
+      console.warn('native play() rejected:', err.name, err.message);
+      // iOS AutoPlay policy: show a tap-to-play overlay instead of error screen
+      if (err.name === 'NotAllowedError') {
+        showTapToPlay();
+      } else {
+        // Real error (format not supported, network, etc.)
+        const live = state.activeTab === 'live' || state.activeTab === 'favorites';
+        if (live && state.lastPlayMeta && !state.lastPlayMeta._m3uOriginal) {
+          if (!tryNextLiveFormat('Formato não suportado')) return;
+        } else {
+          showPlaybackError('Não foi possível reproduzir. Tente outro item ou outro proxy.');
+        }
+      }
+    });
+  }
+}
+
+/* Tap-to-play overlay for iOS autoplay policy */
+function showTapToPlay() {
+  $('buffering-screen').style.display = 'none';
+  let overlay = document.getElementById('tap-to-play-overlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'tap-to-play-overlay';
+    overlay.style.cssText = `
+      position:absolute;inset:0;display:flex;flex-direction:column;
+      align-items:center;justify-content:center;
+      background:rgba(0,0,0,0.55);backdrop-filter:blur(4px);
+      -webkit-backdrop-filter:blur(4px);z-index:50;cursor:pointer;
+    `;
+    overlay.innerHTML = `
+      <div style="width:64px;height:64px;border-radius:50%;background:rgba(79,124,255,0.9);
+        display:flex;align-items:center;justify-content:center;
+        box-shadow:0 4px 24px rgba(79,124,255,0.5);margin-bottom:14px;">
+        <svg width="26" height="26" viewBox="0 0 24 24" fill="white"><polygon points="5,3 19,12 5,21"/></svg>
+      </div>
+      <span style="color:#fff;font-size:15px;font-weight:600;font-family:DM Sans,sans-serif;">Toque para reproduzir</span>
+    `;
+    $('video-wrap').appendChild(overlay);
+  }
+  overlay.style.display = 'flex';
+  overlay.onclick = () => {
+    overlay.style.display = 'none';
+    const vid = $('vid');
+    vid.play().catch(e => {
+      console.warn('manual play failed:', e);
+      showPlaybackError('Não foi possível reproduzir. Tente outro item ou outro proxy.');
+    });
+  };
 }
 
 function showPlaybackError(msg) {
